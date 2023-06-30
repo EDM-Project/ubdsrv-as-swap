@@ -9,11 +9,15 @@
 #include <sw/redis++/redis++.h>
 #include <cstring>
 #include <iostream>
+#include <unordered_map>
 #include "ublksrv_tgt.h"
 
 #define PAGE_SIZE 4096
 using namespace sw::redis;
-std::string redis_conn = "tcp://192.168.188.129:6385";
+
+Redis redis = Redis("tcp://192.168.188.129:6385");
+std::unordered_map<std::string, std::string> cache;
+
 
 static bool backing_supports_discard(char *name)
 {
@@ -334,35 +338,58 @@ static co_io_job __loop_handle_io_async(const struct ublksrv_queue *q,
 		const struct ublksrv_io_desc *iod = data->iod;
 		unsigned ublk_op = ublksrv_get_op(iod);
 		//ublk_log("start handling request!- op is %d, start sector: %llu, num_of_sectors: %d",ublk_op, iod->start_sector, iod->nr_sectors);
-		Redis redis = Redis(redis_conn);
 		if (ublk_op == UBLK_IO_OP_WRITE) { 
 			try { 
 				int num_of_pages = iod->nr_sectors >> 3; 
 				for (int i = 0; i < num_of_pages; i++)
 				{
-					redis.set(std::to_string(iod->start_sector +(i << 3)), std::string(static_cast<const char*>((void*)(iod->addr +(i* PAGE_SIZE))),PAGE_SIZE));
+					std::string key = std::to_string(iod->start_sector +(i << 3));
+					std::string value = std::string(static_cast<const char*>((void*)(iod->addr +(i* PAGE_SIZE))),PAGE_SIZE);	
+					cache[key] = value;			
 				}
+				if (cache.size() > 1024) {
+					//redis.set("above","100");
+ 	   				auto pipeline = redis.pipeline();
+
+					for (const auto& pair : cache) {
+        					pipeline.set(pair.first, pair.second);
+    					}
+  					pipeline.exec();
+  					cache.clear();
+				}
+				ublksrv_complete_io(q, tag, io->tgt_io_cqe->res);
 			}
 			catch (const std::exception& e) { 
 				//ublk_dbg(UBLK_DBG_IO, "failed to SET key-value to redis");
 			}
  		}
-		if (ublk_op == UBLK_IO_OP_READ) { 
+		else if (ublk_op == UBLK_IO_OP_READ) { 
 			try { 
 				int num_of_pages = iod->nr_sectors >> 3; 
 				for (int i = 0; i < num_of_pages; i++)
 				{
-					OptionalString value = redis.get(std::to_string(iod->start_sector + (i << 3)));
-					if (value) { 
-						std::memcpy((void*) (iod->addr + (i*PAGE_SIZE)), value->data(),value->size());
+					std::string key = std::to_string(iod->start_sector + (i << 3));
+					auto it = cache.find(key);
+					if (it != cache.end()) {
+						std::memcpy((void*) (iod->addr + (i*PAGE_SIZE)), it->second.c_str(),PAGE_SIZE);
+					    }
+					else {
+					        OptionalString value = redis.get(key);
+						if (value) { 
+							std::memcpy((void*) (iod->addr + (i*PAGE_SIZE)), value->data(),value->size());
+						}
 					}
+					
 				}
 			}
 			catch (const std::exception& e) { 
 				//ublk_dbg(UBLK_DBG_IO, "failed to GET value from redis");
 			}
-		}	
-		ublksrv_complete_io(q, tag, io->tgt_io_cqe->res);
+			ublksrv_complete_io(q, tag, io->tgt_io_cqe->res);
+		}
+		else {	
+			ublksrv_complete_io(q, tag, io->tgt_io_cqe->res);
+		}
 	} else if (ret < 0) {
 		ublk_err( "fail to queue io %d, ret %d\n", tag, tag);
 	} else {
