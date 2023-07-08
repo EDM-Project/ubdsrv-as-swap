@@ -31,7 +31,6 @@ public:
                 backgroundTask.detach();
             }
             else {
-                //redis.set("wait",std::to_string(cache.size()));
                 cacheCondition.wait(lock, [this]() {
                     return cache.size() <= workloadThreshold;
                 });

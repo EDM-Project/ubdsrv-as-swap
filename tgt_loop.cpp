@@ -18,7 +18,7 @@ using namespace sw::redis;
 
 Redis* redis = nullptr;
 
-ThreadSafeCache* redis_cache = nullptr;
+ThreadSafeCache* redis_staging = nullptr;
 
 
 static bool backing_supports_discard(char *name)
@@ -178,7 +178,7 @@ static int loop_init_tgt(struct ublksrv_dev *dev, int type, int argc, char
 	if (redis == nullptr) { 
 		return -1;
 	}
-	redis_cache = new ThreadSafeCache(redis);
+	redis_staging = new ThreadSafeCache(redis);
 	
 	fd = open(file, O_RDWR);
 	if (fd < 0) {
@@ -353,14 +353,39 @@ static co_io_job __loop_handle_io_async(const struct ublksrv_queue *q,
 		const struct ublksrv_io_desc *iod = data->iod;
 		unsigned ublk_op = ublksrv_get_op(iod);
 		//ublk_log("start handling request!- op is %d, start sector: %llu, num_of_sectors: %d",ublk_op, iod->start_sector, iod->nr_sectors);
-		if (ublk_op == UBLK_IO_OP_WRITE) { 
+ 		if (ublk_op == UBLK_IO_OP_WRITE) { 
 			try { 
 				int num_of_pages = iod->nr_sectors >> 3; 
-				for (int i = 0; i < num_of_pages; i++)
-				{
-					std::string key = std::to_string(iod->start_sector +(i << 3));
-					std::string value = std::string(static_cast<const char*>((void*)(iod->addr +(i* PAGE_SIZE))),PAGE_SIZE);
-					redis_cache->addToCache(key,value);
+				bool pipeline_enabled = true;
+				if (num_of_pages < 32) pipeline_enabled = false;
+
+				if (pipeline_enabled) {
+					for (int i = 0; i < num_of_pages; i++)
+					{
+						std::string key = std::to_string(iod->start_sector +(i << 3));
+						auto val = redis_staging->getFromCache(key);
+						if (val.length() != 0){
+							pipeline_enabled = false;
+							break;
+						}
+					}
+				}
+				if (pipeline_enabled) {
+					auto pipeline = redis->pipeline();
+					for (int i = 0; i < num_of_pages; i++)
+					{
+						std::string key = std::to_string(iod->start_sector +(i << 3));
+						std::string value = std::string(static_cast<const char*>((void*)(iod->addr +(i* PAGE_SIZE))),PAGE_SIZE);
+						pipeline.set(key,value);
+					}
+					pipeline.exec();
+				} else{
+					for (int i = 0; i < num_of_pages; i++)
+					{
+						std::string key = std::to_string(iod->start_sector +(i << 3));
+						std::string value = std::string(static_cast<const char*>((void*)(iod->addr +(i* PAGE_SIZE))),PAGE_SIZE);
+						redis_staging->addToCache(key,value);
+					}
 				}
 				ublksrv_complete_io(q, tag, io->tgt_io_cqe->res);
 			}
@@ -368,21 +393,43 @@ static co_io_job __loop_handle_io_async(const struct ublksrv_queue *q,
 				//ublk_dbg(UBLK_DBG_IO, "failed to SET key-value to redis");
 			}
  		}
-		else if (ublk_op == UBLK_IO_OP_READ) { 
+ 		else if (ublk_op == UBLK_IO_OP_READ) { 
 			try { 
-				int num_of_pages = iod->nr_sectors >> 3; 
-				for (int i = 0; i < num_of_pages; i++)
-				{
+				int num_of_pages = iod->nr_sectors >> 3;
+				bool pipeline_enabled = true;
+				for (int i =0; i < num_of_pages ; i ++) { 
 					std::string key = std::to_string(iod->start_sector + (i << 3));
-					auto val = redis_cache->getFromCache(key);
-					if (val.length() != 0) { 
-						std::memcpy((void*) (iod->addr + (i*PAGE_SIZE)), val.c_str(),PAGE_SIZE);
-					} else {
-					        OptionalString value = redis->get(key);
-						if (value) { 
-							std::memcpy((void*) (iod->addr + (i*PAGE_SIZE)), value->data(),value->size());
-						}
+					auto val = redis_staging->getFromCache(key);
+					if (val.length() != 0){
+						pipeline_enabled = false;
 					}
+				}
+				if (pipeline_enabled) { 
+					auto pipeline = redis->pipeline();
+					for (int i =0; i < num_of_pages; i++) { 
+						std::string key = std::to_string(iod->start_sector + (i << 3));
+						pipeline.get(key);
+					}
+					auto results = pipeline.exec();
+					for (int i=0; i< num_of_pages; i++) {
+						auto value = results.get<std::string>(i);
+						std::memcpy((void*) (iod->addr + (i*PAGE_SIZE)), value.c_str(),PAGE_SIZE);
+					}
+				}
+				else { 
+					for (int i = 0; i < num_of_pages; i++)
+					{
+						std::string key = std::to_string(iod->start_sector + (i << 3));
+						auto val = redis_staging->getFromCache(key);
+						if (val.length() != 0) { 
+							std::memcpy((void*) (iod->addr + (i*PAGE_SIZE)), val.c_str(),PAGE_SIZE);
+						} else {
+						        OptionalString value = redis->get(key);
+							if (value) { 
+								std::memcpy((void*) (iod->addr + (i*PAGE_SIZE)), value->data(),value->size());
+							}
+						}
+				        }
 				}
 			}
 			catch (const std::exception& e) { 
@@ -390,14 +437,7 @@ static co_io_job __loop_handle_io_async(const struct ublksrv_queue *q,
 			}
 			ublksrv_complete_io(q, tag, io->tgt_io_cqe->res);
 		}
-		else if (ublk_op == UBLK_IO_OP_DISCARD) {
-			redis->set("discard","not_supported");
-		}
-		else if (ublk_op == UBLK_IO_OP_FLUSH) {
-			redis->set("FLUSH","not_supported");
-		}
 		else {	
-			redis->set("wtf","wtf");
 			ublksrv_complete_io(q, tag, io->tgt_io_cqe->res);
 		}
 	} else if (ret < 0) {
@@ -435,7 +475,7 @@ static void loop_tgt_io_done(const struct ublksrv_queue *q,
 
 static void loop_deinit_tgt(const struct ublksrv_dev *dev)
 {
-	redis_cache->emptyCache();
+	redis_staging->emptyCache();
 	fsync(dev->tgt.fds[1]);
 	close(dev->tgt.fds[1]);
 }
